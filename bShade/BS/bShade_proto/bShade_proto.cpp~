@@ -1,0 +1,424 @@
+/* bShade prototype firmware
+ * 
+ * This firmware is protected by copyright laws and is the property of Bajtasist d.o.o.
+ * 
+ * Main bShade firmware for communication and command execution.
+ * It includes the bFly protocol and common checks.
+ * 
+ * Devoted to my belowed wife and daugther.
+ * 
+ * Bajtasist (C) 2015 
+ */
+
+
+#include "EEPROM.h"
+#include "cc1101.h"
+
+// The LED is wired to the Arduino Output 4 (physical panStamp pin 19)
+#define LEDOUTPUT 13
+
+// Define some packets
+#include "Arduino.h"
+void blinker();
+void cc1101signalsInterrupt(void);
+void setup();
+void ReadLQI();
+void ReadRSSI();
+void getPacket();
+void SayHi();
+void send_data(byte* DID, byte* SID, byte packetType, byte* sync, byte* payload, byte* CRC);
+void loop();
+byte HI_ON_AIR[] = { 0xFF, 0xF1, 0xF2, 0xF3 };
+
+
+// The connection to the hardware chip CC1101 the RF Chip
+#include "Arduino.h"
+CC1101 cc1101;
+
+byte b;
+byte i;
+byte syncWord = 199;
+long counter=0;
+byte chan=0;
+byte serialNumber[10];
+byte dataPayload[15];
+int confirmLink = 0;
+
+  // BSNetFly protocol
+
+byte  broadcast[]= {0xFF,0xFF,0xFF,0xFF};
+byte sid[] = {0x30,0x30,0x30,0x31};
+byte packetType[] = {0xBC, 0xCF, 0xAA, 0xCC};
+byte payload[] = {0x50,0x51,0x52,0x53,0x54,0x55,0x56,0x57};
+byte CRC[] = {0xFF,0xFF};
+byte syncKey[3];
+
+
+
+// a flag that a wireless packet has been received
+boolean packetAvailable = false;
+
+
+/* Handle interrupt from CC1101 (INT0) gdo0 on pin2 */
+void cc1101signalsInterrupt(void){
+   // set the flag that a package is available
+   packetAvailable = true;
+}
+
+void setup()
+{
+   Serial.begin(38400);
+   Serial.println("start and hello");
+   
+   // Bajtasist synckey lsb
+   syncKey[0] = 0xb7;
+   
+   int y = 0;
+   // Get the serialNr
+   for (int x = 0; x<10; x++) {
+      serialNumber[x] = EEPROM.read(x);
+   }
+   //if (serialNumber[0] == 255) {
+   //  Serial.println ("Detected unset serial number!");
+   //  Serial.println ("Please input serial number: ");
+   //   while (y < 10) {
+   //     if (Serial.available() > 0) {
+   //       int incomingByte = Serial.read();
+   //       Serial.print ("I recieved: ");
+   //       Serial.println (incomingByte, DEC);
+   //       y++;
+   //     }
+   //   }
+   //}
+   Serial.print("SerialNR: ");
+   for (int x = 0; x<10; x++) {
+      Serial.print(serialNumber[x], DEC);
+   }
+   Serial.println();
+   delay(3000);
+   
+   // initialize the RF Chip
+   cc1101.init();
+   
+   cc1101.setCarrierFreq(CFREQ_433);
+   //   cc1101.setCarrierFreq(CFREQ_868);
+   cc1101.disableAddressCheck(); //if not specified, will only display "packet received"
+   cc1101.setTxPowerAmp(PA_LongDistance);
+   
+   Serial.print("CC1101_PARTNUM "); //cc1101=0
+   Serial.println(cc1101.readReg(CC1101_PARTNUM, CC1101_STATUS_REGISTER));
+   Serial.print("CC1101_VERSION "); //cc1101=4
+   Serial.println(cc1101.readReg(CC1101_VERSION, CC1101_STATUS_REGISTER));
+   Serial.print("CC1101_MARCSTATE ");
+   Serial.println(cc1101.readReg(CC1101_MARCSTATE, CC1101_STATUS_REGISTER) & 0x1f);
+   
+   // set our own syncWord
+   cc1101.writeReg(CC1101_SYNC1, 0x47);
+   cc1101.writeReg(CC1101_SYNC0, 0x00);
+   
+   // set device address
+   cc1101.writeReg(CC1101_ADDR, 0x00);
+   
+   // set channel
+   cc1101.writeReg(CC1101_CHANNR, 0x03);
+   // try to read registers
+   byte jao[64];
+   cc1101.readBurstReg(jao,0x00,64);
+   
+   int x = 0;
+   for (x=0;x<sizeof(jao);x++) {
+      Serial.println (jao[x], HEX);
+   }
+   
+   attachInterrupt(0, cc1101signalsInterrupt, FALLING);
+   
+   Serial.println("device initialized");
+}
+
+void ReadLQI()
+{
+   byte lqi=0;
+   byte value=0;
+   lqi=(cc1101.readReg(CC1101_LQI, CC1101_STATUS_REGISTER));
+   value = 0x3F - (lqi & 0x3F);
+   Serial.print("LQi: ");
+   Serial.print(value);
+   Serial.println ("%");
+}
+
+void ReadRSSI()
+{
+   byte rssi=0;
+   byte value=0;
+   
+   rssi=(cc1101.readReg(CC1101_RSSI, CC1101_STATUS_REGISTER));
+   
+   if (rssi >= 128)
+     {
+	value = 255 - rssi;
+	value /= 2;
+	value += 74;
+     }
+   else
+     {
+	value = rssi/2;
+	value += 74;
+     }
+   Serial.print("RSSI: ");
+   Serial.print(value);
+   Serial.println(" dbi");
+}
+
+
+
+// Introduce over the air
+void SayHi() {
+   Serial.println ("Say hi on air.");
+   //send_data(0xBC,HI_ON_AIR,sizeof(HI_ON_AIR));
+   send_data (broadcast,sid,packetType[0],syncKey,payload,CRC);
+   confirmLink = 0;
+}
+
+void CFLink(byte* DID, byte* sync) {
+   Serial.print ("Sending CF packet to: ");
+   Serial.print (DID[0],HEX);
+   Serial.print(DID[1], HEX);
+   Serial.print(DID[2], HEX);
+   Serial.println(DID[3], HEX);
+   Serial.print ("SyncKEY: ");
+   Serial.print (sync[0], HEX);
+   Serial.println(sync[1], HEX);
+} 
+
+
+
+void send_data(byte* DID, byte* SID, byte packetType, byte* sync, byte* payload, byte* CRC) {
+   CCPACKET data;
+   data.length=22;
+   byte blinkCount=counter++;
+   
+   // Start forming packet
+   // DID first
+   for (byte x=0; x<4; x++) {
+      data.data[x] = DID[x];
+   }
+   // SID second
+   for (byte x=0; x<4; x++) {
+      data.data[4 + x] = SID[x];
+   }
+   // packetType
+   data.data[8] = packetType;
+   // SYNCKEY 
+   for (byte x=0; x<3; x++) {
+      data.data[9 + x] = sync[x];
+   }
+   // Payload is populated with 8 bytes of data for now.
+   for (byte x=0; x<8; x++) {
+      data.data[12 + x] = payload[x];
+   }
+   // CRC as last. fooBar for now.
+   for (byte x=0; x<2; x++) {
+      data.data [20 + x] = CRC[x];
+   }  
+   //data.data[10] = blinkCount;
+   
+   // Here comes the payload
+   //for (int pnr=0;pnr<len;pnr++) {
+   //  data.data[11 + pnr] = payload[pnr];
+   //}
+   //data.data[31]= 0x55;
+   /*   Serial.println("Data to be sent:");
+    for (int yo=0; yo<data.length; yo++) 
+    {
+    Serial.println (data.data[yo], HEX);
+    }
+    */   
+   Serial.print("CC1101_MARCSTATE ");
+   Serial.println(cc1101.readReg(CC1101_MARCSTATE, CC1101_STATUS_REGISTER) & 0x1f);
+   if(cc1101.sendData(data)){
+      Serial.println(" sent ok :)");
+   } else {
+      Serial.println("sent failed :(");
+   }
+}
+
+void loop() {
+   //if (confirmLink == 0) { SayHi(); }
+   //else {  //delay (200);
+   getPacket(); 
+   //SayHi();
+   delay(200);
+}
+
+// processPacket routine. This is really experimental, so take extensive care. Eventually, 
+// this is to become the main routine for packet processing, aka. it knows what the packet is,
+// decrypts and decodes. After that it forwards the command to the execution function if applicable.
+// 
+int processPacket(byte* did, byte* sid, byte packetType, byte* payload, byte* sync) 
+{
+   // Defined variables for packet generation. 
+//   byte sync[] = { 0xB7, 0x00 };
+   byte crc[] = { 0xFF, 0xFF };
+
+   // Some statistics
+   ReadRSSI();
+   ReadLQI();
+   
+   Serial.println("I did run, but did something!");
+   
+   Serial.print(did[0], HEX);
+   Serial.print(":");
+   Serial.print(did[1], HEX);
+   Serial.print(":");
+   Serial.print(did[2], HEX);
+   Serial.print(":");
+   Serial.println(did[3], HEX);
+ 
+   
+   switch (packetType)
+     {
+      case 0xAA:
+	Serial.println ("Confirmation packet recieved.");
+	delay(1000);
+	send_data (did,sid,0xAA,sync,payload,crc);
+	confirmLink = 2;
+	Serial.println ("Link established. Device ready.");
+	syncKey[0] = sync[0];
+	syncKey[1] = sync[1];
+	syncKey[2] = sync[2];
+	break;
+	
+      case 0xBA:
+	if (confirmLink == 2) { Serial.println ("Already synced."); } else {
+	   Serial.println("Replying to BROADCAST.");
+	   Serial.print("Will now only listen to master: ");
+	   Serial.print(did[0], HEX);
+	   Serial.print(":");
+	   Serial.print(did[1], HEX);
+	   Serial.print(":");
+	   Serial.print(did[2], HEX);
+	   Serial.print(":");
+	   Serial.println(did[3], HEX);
+	   // Try to confirm
+	   Serial.println ("Sending confirmation packet.");
+	   confirmLink = 1;
+	   delay(1000);
+	   
+	   
+	   //processPacket(did, sid, 0xCF, packet.data);
+	   send_data (did,sid,0xCF,sync,payload,crc);
+	   break;
+
+	}
+	
+      case 0xCC:
+	if (sync == syncKey) 
+	  {
+	     Serial.println("Command detected with valid synckey!");
+	  }
+	
+	else 
+	  {
+	     Serial.println("Command detected with invalid synckey!");
+	  }
+	
+	break; 
+     }
+   
+   
+   return 0;
+}
+
+
+
+// getPacket is used to wait for the interrupt and read the packet out of CC1101
+
+void getPacket()
+{
+  //Serial.println("RCV mode!");
+  if(packetAvailable){
+//Serial.println("packet received");
+// Disable wireless reception interrupt
+detachInterrupt(0);
+// Define packet type
+CCPACKET packet;
+     
+
+
+
+// clear the flag
+packetAvailable = false;
+
+
+
+if(cc1101.receiveData(&packet) > 0){
+   Serial.println("Packet recieved. Is it for us?");
+   if(!packet.crc_ok) {
+      Serial.println("crc not ok");
+      confirmLink = 0;
+   }
+   
+   byte did[] = { packet.data[4], packet.data[5], packet.data[6], packet.data[7] };
+   byte sync[] = { packet.data[9], packet.data[10], packet.data[11] };
+   byte payload[] = { 0x00, 0x00, 0x00, 0x00 };
+   byte crc[] = { 0xFF, 0xFF };
+      
+   // Check if the packet is for us, else discard
+
+
+   // If the packet is BROADCAST, we need to reply properly
+   if (packet.data[0] == 0xFF  && packet.data[1] == 0xFF   && packet.data[2] == 0xFF  && packet.data[3] == 0xFF ) {
+
+      if(packet.length > 0){
+	 Serial.println("Detected BROADCAST packet.");
+	 processPacket(did, sid, packet.data[8], packet.data, sync);
+      }
+   
+   }
+
+   else if (packet.data[0] == sid[0]  && packet.data[1] == sid[1]   && packet.data[2] == sid[2]  && packet.data[3] == sid[3]){
+  
+      if (packet.data[9] == 0xB7) {
+   
+	 Serial.println("Detected signed packet."); 
+	 Serial.println (confirmLink);
+	 
+   
+	 if(packet.length > 0){
+	    // Defined variables for packet generation. 
+	    byte did[] = { packet.data[4], packet.data[5], packet.data[6], packet.data[7] };
+	    byte sync[] = { packet.data[9], packet.data[10], packet.data[11] };
+	    byte payload[] = { 0x00, 0x00, 0x00, 0x00 };
+	    byte crc[] = { 0xFF, 0xFF };
+
+	    processPacket(did, sid, packet.data[8], packet.data, sync);
+	    //  send_data (did,sid,0xCF,sync,payload,crc);
+
+
+	 }
+  
+	 
+      }
+   
+   
+      else { Serial.println("SynKey not recognized!"); }
+   }
+} else 
+       {
+	  Serial.println("Invalid data on air.");
+       }
+     
+     
+     attachInterrupt(0, cc1101signalsInterrupt, FALLING);
+     
+     
+  }
+}
+
+
+
+
+
+   
+
+

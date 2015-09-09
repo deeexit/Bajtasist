@@ -1,0 +1,14 @@
+
+
+
+
+
+.build/uno/src/cc1101_tx.cpp : src/cc1101_tx.ino
+	@mkdir -p .build/uno/src
+	@echo [93msrc/cc1101_tx.ino[0m
+	@/usr/local/bin/ino preproc  -o $@ $^
+
+
+all : .build/uno/src/cc1101_tx.cpp
+	@true
+
